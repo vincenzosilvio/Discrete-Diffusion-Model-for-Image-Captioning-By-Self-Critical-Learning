@@ -1,7 +1,7 @@
 # Exploring Discrete Diffusion Models for Image Captioning.
 
 
-## Implementation of the paper ["Exploring Discrete Diffusion Models for Image Captioning"](https://arxiv.org/abs/2211.11694)
+## Official implementation for the paper ["Exploring Discrete Diffusion Models for Image Captioning"](https://arxiv.org/abs/2211.11694)
 
 
 ## Training prerequisites
@@ -58,6 +58,13 @@ If you want train the model with trainable clip, you can use the command:
 MKL_THREADING_LAYER=GPU  python -m torch.distributed.launch --nproc_per_node 8  train_tclip.py  --out_dir /results_diff --tag caption_diff_vitb16
 ```
 Please noting that we detach the gradients of [CLS] tokens during the training process of clip model. Because We observe that when the image encoder (clip) is trainable, the gradient backward of [CLS] tokens will damage the training of image encoder (clip).
+
+### Self-critical training
+Start from a cross-entropy checkpoint and fine-tune with CIDEr-D as the reward:
+```
+MKL_THREADING_LAYER=GPU  python -m torch.distributed.launch --nproc_per_node 8  train.py  --out_dir /results_diff --tag caption_diff_vitb16_scst --scst --init_checkpoint results_diff/caption_diff_vitb16/caption_diff_vitb16-019.pt --lr 1e-5 --bs 32 --epochs 2
+```
+The policy is the model's own unmasking sampler: each image gets `--scst_sample_n` sampled captions and one greedy caption, the greedy CIDEr-D is the baseline (`--scst_baseline mean` uses the other samples instead), and the loss is -(r - b) log p(sampled caption). `--scst_replay_steps` sets how many unmasking steps per caption are replayed with gradients (0 = all). See `scst.py` for details and `tests/test_scst.py` for CPU checks (`python -m pytest tests/test_scst.py`).
 ## Citation
 If you use this code for your research, please cite:
 ```

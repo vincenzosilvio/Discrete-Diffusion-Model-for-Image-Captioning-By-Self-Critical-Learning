@@ -33,6 +33,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 import numpy as np
 from lr_scheduler import build_scheduler
 from misc import *
+import scst
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
@@ -418,7 +419,9 @@ class ClipCaptionModel(nn.Module):
 
     def forward(self, tokens: torch.Tensor, mask_tokens: torch.Tensor, prefix: torch.Tensor,
                 mask: Optional[torch.Tensor] = None, t = None,
-                labels: Optional[torch.Tensor] = None):
+                labels: Optional[torch.Tensor] = None, image_feats=None, image_free=None):
+        # image_feats: precomputed (prefix, len_cls) from image_encode, used instead of `prefix`
+        # image_free: bool (batch,) rows that use pad_embedding instead of the image
 
         self.clip_model.eval()
         # tokens = torch.where(mask_tokens == 50257, tokens, mask_tokens) # if you want to use beta, add this line
@@ -429,11 +432,16 @@ class ClipCaptionModel(nn.Module):
         bos_token_embedding = bos_token_embedding.repeat_interleave(repeats=seq_len, dim=1)
         mask_tokens = mask_tokens.unsqueeze(dim=2).repeat_interleave(repeats=self.gpt_embedding_size, dim=2)
         embedding_text = torch.where(mask_tokens == 50257, bos_token_embedding, embedding_text)
-        with torch.no_grad():
-            prefix, len_cls = self.image_encode(prefix)
-            #print('*** Size feature ***', prefix)
+        if image_feats is None:
+            with torch.no_grad():
+                prefix, len_cls = self.image_encode(prefix)
+        else:
+            prefix, len_cls = image_feats
         prefix_projections = self.clip_project(prefix)
-        if self.training:
+        if image_free is not None:
+            pad = self.pad_embedding.unsqueeze(0).to(prefix_projections.dtype)
+            prefix_projections = torch.where(image_free[:, None, None], pad, prefix_projections)
+        elif self.training:
             empty_idx = int(self.if_drop_rate * batch_size)
             for i_image in range(empty_idx):
                 prefix_projections[i_image,:,:] = self.pad_embedding
@@ -681,32 +689,6 @@ def val(model, epoch, val_dataloader, args, filename, instance:bool, map_locatio
     val_loss_all = {}
     preprocess = _transform(224)
 
-    CiderD = None
-    Cider = None
-    Bleu = None
-    CiderD,Cider,Bleu = init_scorer(args.cached_tokens)
-
-    list_gen_cap = []
-    list_gen_id = []
-    list_gt_cap = []
-
-    dataset = json.load(open('/home/v.silvio/diffusion-image-captioning-main/Paper2/DDCap-main/MSCOCO_Caption/annotations/captions_val2014.json', 'r'))
-    #dataset = dataset.getAnns()
-
-    imgToAnns = {ann['image_id']: [] for ann in dataset['annotations']}
-    anns =      {ann['id']:       [] for ann in dataset['annotations']}
-    annotation = json.load(open("./MSCOCO_Caption/annotations/captions_val2014.json", "r"))["annotations"]
-
-    for x in annotation:
-        #print(x['image_id'])
-        list_gen_id.append(x['image_id'])
-
-    for ann in dataset['annotations']:
-        imgToAnns[ann['image_id']] += [ann]
-        anns[ann['id']] = ann
-
-
-
     for i_vl in range(model.module.time_step):
         val_loss_all[f'vl_loss_{i_vl}'] = []
 
@@ -767,43 +749,7 @@ def val(model, epoch, val_dataloader, args, filename, instance:bool, map_locatio
             assert False, "Not check beam search for now"
             generated_text_prefix = generate_beam(model, tokenizer, embed=prefix_embed)[0]
         else:
-            #STO GENERANDO I TOKEN, NON IL TESTO PERCHè SC=TRUE
-            generated_text_prefix = generate2_adpt_if(model, tokenizer, embed=prefix_embed, len_pre=len_pre.argmax(-1) + 1,guidance_scale=1.06,  sc = False)
-            generated_text2_prefix = generate2_adpt_if(model, tokenizer, embed=prefix_embed, len_pre=len_pre.argmax(-1) + 1,guidance_scale=1.00,  sc = False)
-
-
-            #generated_token_prefix = generate2_adpt_if(model, tokenizer, embed=prefix_embed, len_pre=len_pre.argmax(-1) + 1,guidance_scale=1.06,  sc = True)
-            #generated_token2_prefix = generate2_adpt_if(model, tokenizer, embed=prefix_embed, len_pre=len_pre.argmax(-1) + 1, guidance_scale=1.00, sc=True)
-
-
-            for i in range(0,len(image_path)):
-                string = image_path[i].split("_")
-                string = string[2]
-                string = string.lstrip('0')
-                string = string[0:-4]
-                image_path[i] = string
-                
-            #print('Image path:',image_path)
-
-            #print('List gen id:',list_gen_id[0:32])
-
-            #print(list_gen_id[args.bs*idx:args.bs*(idx+1)])
-
-            for i in range(0,len(image_path)):
-                #print(imgToAnns[int(image_path[i])][0]['caption'])
-                list_gt_cap.append(imgToAnns[int(image_path[i])][0]['caption'])
-                list_gen_cap.append(generated_text_prefix[i])
-                #print(generated_text_prefix[i])
-
-            print('Computing reward')
-            #REWARD CON LE 5 CAPTION/IMAGE
-            
-            reward = get_self_critical_reward(generated_text_prefix, list_gt_cap, generated_text2_prefix, args, CiderD, Cider, Bleu, os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"),
-                                            os.path.join(args.data_root, 'annotations/captions_val2014.json'))
-
-            reward = torch.from_numpy(reward).to(logits)
-
-            exit()
+            generated_text_prefix = generate2_adpt_if(model, tokenizer, embed=prefix_embed, len_pre=len_pre.argmax(-1) + 1, guidance_scale=args.eval_guidance)
 
         torch.cuda.synchronize()
         progress.update()
@@ -986,6 +932,22 @@ def parse_args():
 
     parser.add_argument('--cider_reward_weight', type=float, default=1)
     parser.add_argument('--bleu_reward_weight', type=float, default=0)
+    parser.add_argument('--init_checkpoint', default='results_diff/caption_diff_vitb16/caption_diff_vitb16-019.pt',
+                        help='checkpoint to start from (the cross-entropy model for --scst); empty to start from scratch')
+    parser.add_argument('--eval_guidance', type=float, default=1.06, help='classifier-free guidance scale at evaluation')
+    # self-critical training (see scst.py)
+    parser.add_argument('--scst', action='store_true', help='train with self-critical learning instead of cross-entropy')
+    parser.add_argument('--scst_sample_n', type=int, default=5, help='sampled captions per image')
+    parser.add_argument('--scst_baseline', choices=['greedy', 'mean'], default='greedy',
+                        help='greedy: CIDEr-D of the greedy caption; mean: mean CIDEr-D of the other samples')
+    parser.add_argument('--scst_guidance', type=float, default=1.0,
+                        help='guidance scale of the policy, used for both sampling and log p')
+    parser.add_argument('--scst_replay_steps', type=int, default=4,
+                        help='unmasking steps per caption replayed with grad (rescaled); 0 replays all')
+    parser.add_argument('--scst_sample_length', action='store_true',
+                        help='sample the caption length from len_head and train it with the reward')
+    parser.add_argument('--scst_sample_slot', action='store_true',
+                        help='sample which slot to unmask instead of taking the most confident one')
 
 
     parser.set_defaults(enable_amp=True)
@@ -997,177 +959,105 @@ def parse_args():
     save_config(args)
     return args
 
-import h5py
+class ScstCocoDataset(Dataset):
+    """One item per training image, with all of its reference captions (for CIDEr-D)."""
 
-def self_critical(val_dataloader,model,epoch,map_location,writerMetrics,optimizer,scaler,lr_scheduler):
+    def __len__(self) -> int:
+        return len(self.image_ids)
 
-    #loss = ScstRewardCriterion(cider_cached_tokens='corpus',baseline_type='greedy')
+    def __getitem__(self, item: int):
+        img_id = self.image_ids[item]
+        filename = f"{self.data_root}/train2014/COCO_train2014_{int(img_id):012d}.jpg"
+        try:
+            image = io1.imread(filename)
+        except:
+            filename = f"{self.data_root}/val2014/COCO_val2014_{int(img_id):012d}.jpg"
+            image = io1.imread(filename)
+        image = self.preprocess(Image.fromarray(image))
+        return image, item
 
-    h5_label_file = h5py.File('/home/v.silvio/diffusion-image-captioning-main/Paper2/DDCap-main/ImageCaptioning/data/cocotalk_label.h5', 'r', driver='core')
-    # load in the sequence data
-    seq_size = h5_label_file['labels'].shape
-    label =h5_label_file['labels'][:]
-    seq_length = seq_size[1]
-    print('max sequence length in data is', seq_length)
-    # load the pointers in full to RAM (should be small enough)
-    label_start_ix = h5_label_file['label_start_ix'][:]
-    label_end_ix = h5_label_file['label_end_ix'][:]
-
-    gts = []
-    print(len(label))
-
-    for i in range(0,123286):
-        gts.append(label[label_start_ix[i] - 1: label_end_ix[i]])
+    def __init__(self, data_root: str, data_path: str):
+        self.data_root = data_root
+        self.preprocess = _transform(224)
+        with open(data_path, 'rb') as f:
+            all_data = pickle.load(f)
+        refs = OrderedDict()
+        for caption in all_data["captions"]:
+            refs.setdefault(caption["image_id"], []).append(caption["caption"])
+        self.image_ids = list(refs.keys())
+        self.refs = list(refs.values())
 
 
+def self_critical(model, epoch, scst_dataloader, cider, optimizer, lr_scheduler, scaler, args, writer):
+    """One epoch of self-critical training on the model's own diffusion samples.
 
-    out = {}
-    CiderD = None
-    Cider = None
-    Bleu = None
-    CiderD,Cider,Bleu = init_scorer(args.cached_tokens)
-    best_cider = 0
-    rl_crit = RewardCriterion()
+    For each image: roll out scst_sample_n captions with the stochastic sampler and one
+    greedy caption, score them with CIDEr-D against the image's references, and
+    backpropagate -(r - b) * log p(sampled caption). See scst.py.
+    """
+    core = model.module
+    # the policy is the sampler we evaluate: no dropout and no random image-free rows
+    model.eval()
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-    result_all = []
+    refs_all = scst_dataloader.dataset.refs
+    n = args.scst_sample_n
+    num_steps = len(scst_dataloader)
+    scst_dataloader.sampler.set_epoch(epoch)
+    print(f">>> Self-critical epoch {epoch}")
+    progress = tqdm(total=num_steps, desc=args.tag)
 
-    num_steps = len(val_dataloader)
-    epoch = 0
-    #train_dataloader.sampler.set_epoch(epoch)
-    val_dataloader.sampler.set_epoch(epoch)
-    model.train()
-     #for idx, (tokens, mask, prefix, gt) in enumerate(val_dataloader)
-    
-    print('Len val_dataloader:',len(val_dataloader))
-    
-    for idx, (image, image_path, tokens, gt, mask) in enumerate(val_dataloader):
-
-        tokens = tokens.cuda(non_blocking=True)
-        mask = mask.cuda(non_blocking=True)
-        #prefix = prefix.cuda(non_blocking=True)
-        gt = gt.cuda(non_blocking=True)
-
-        #print('*** GT ***', gt[0:10])
-        #print('*** GT H5 ***', gts[0:10])
+    for idx, (image, item) in enumerate(scst_dataloader):
         image = image.cuda(non_blocking=True)
-        #image_path = image_path.cuda(non_blocking=True)
+        refs = [refs_all[i] for i in item.tolist()]
+        b = image.size(0)
 
+        with torch.no_grad(), amp.autocast(enabled=args.enable_amp):
+            prefix, len_cls = core.image_encode(image)
+            len_logits = core.len_head(len_cls).float()
+        greedy_len = len_logits.argmax(-1) + 1
+        if args.scst_sample_length:
+            sample_len = torch.multinomial(F.softmax(len_logits, -1), n, replacement=True).flatten() + 1
+        else:
+            sample_len = greedy_len.repeat_interleave(n)
+        feats = (prefix.repeat_interleave(n, 0), len_cls.repeat_interleave(n, 0))
 
-        #Greedy result
-        b, device = mask.size()[0], mask.device
-        t, pt = sample_time(b, torch.tensor(5).to(torch.int), device)
-        # add noise
-        log_x_start = index_to_log_onehot(tokens, model.module.num_classes)
-        log_xt = model.module.q_sample(log_x_start=log_x_start, t=t)
-        xt = log_onehot_to_index(log_xt) 
-        mask_tokens = xt
+        with amp.autocast(enabled=args.enable_amp):
+            sample_tokens, steps = scst.rollout(core, feats, sample_len, sample=True,
+                                                guidance_scale=args.scst_guidance, sample_slot=args.scst_sample_slot)
+            greedy_tokens, _ = scst.rollout(core, (prefix, len_cls), greedy_len, sample=False,
+                                            guidance_scale=args.scst_guidance)
+        sample_caps = scst.decode_captions(sample_tokens, sample_len, tokenizer)
+        greedy_caps = scst.decode_captions(greedy_tokens, greedy_len, tokenizer)
 
-
-        #GenResult
-        xtCum = torch.zeros(args.bs*5,20)
-        xtCum = xtCum.cuda(non_blocking=True)
-        print('Inizializzo sample, itx:',idx)
-
-        if(idx==(len(val_dataloader)-1)):
-            break
-
-        sample_logprobs = [None] * 5
-        len_out = [None] * 5
-
-        for i_t in range(0, 5):
-            b, device = mask.size()[0], mask.device
-
-            if(b!=args.bs):
-                break
-            t = torch.tensor(i_t, device=device).long().repeat_interleave(repeats=b)
-            #t, pt = sample_time(b, torch.randint(0,20,(1,)).item(), device)
-            log_x_start = index_to_log_onehot(tokens, model.module.num_classes)
-            log_xt = model.module.q_sample(log_x_start=log_x_start, t=t)
-            xtCum[(args.bs*i_t):(args.bs*(i_t+1)),:] = log_onehot_to_index(log_xt) 
-            xtCum_it = xtCum[(args.bs*i_t):(args.bs*(i_t+1)),:]
-
-            # generate concentrate mask attention
-            ex_mask = torch.zeros_like(xtCum_it) - 10000
-            ex_nomask = torch.zeros_like(xtCum_it)
-            all_mask = torch.where(xtCum_it == 50257, ex_mask, ex_nomask)
-            all_mask = all_mask.unsqueeze(dim=1).repeat_interleave(repeats=xtCum_it.size(1), dim=1)
-            for each_b in range(all_mask.size(0)):
-                for each_token in range(all_mask[each_b].size(0)):
-                    all_mask[each_b, each_token, each_token] = 0
-            padding_mask = mask.unsqueeze(dim=1)
-            padding_mask = (1.0 - padding_mask.long()) * -10000
-            all_mask = torch.clamp(all_mask + padding_mask, -10000, 0)
-
-            sample_logprobs[i_t], len_out[i_t] = model(tokens, xtCum_it, image, all_mask, t)
-            sample_logprobs[i_t] = sample_logprobs[i_t].logits
-
-
-        
-        sample_logprobs = torch.cat(sample_logprobs,0).cuda()
-        
-        #sample_logprobs = torch.cat((torch.zeros(sample_logprobs.shape[0],sample_logprobs.shape[1],1).cuda(),sample_logprobs),dim=2)
-        #sample_logprobs = torch.cat((sample_logprobs,torch.zeros(sample_logprobs.shape[0],sample_logprobs.shape[1],1).cuda()-1),dim=2)
-
-
-        len_out = torch.cat(len_out,0)
-        gt_list = gt.tolist()
-        xtCum = xtCum.type(torch.int64) 
-        
-
-        '''reward = get_self_critical_reward(xt, gt, xtCum, args, CiderD, Cider, Bleu, os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"),
-                                            os.path.join(args.data_root, 'annotations/captions_val2014.json'))'''
-        
-        #REWARD CON LE 5 CAPTION/IMAGE
-        reward = get_self_critical_reward(xt, gts[idx*args.bs:(idx+1)*args.bs], xtCum, args, CiderD, Cider, Bleu, os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"),
-                                            os.path.join(args.data_root, 'annotations/captions_val2014.json'))
-        
-        reward = torch.from_numpy(reward).to(sample_logprobs)
-        xtCum = xtCum - 1
-
-        #print(sample_logprobs.shape)
-        #loss, flag = rl_crit(sample_logprobs, xtCum, reward, gt.flatten().repeat(5),reduction='mean')
-        #if(flag==-1):
-        #    print('skipping ',idx,'-th iteration')
-
-        cond = torch.zeros(gt.shape[0],gt.shape[1],device=0)
-        cond2= torch.ones(gt.shape[0],gt.shape[1],device=0)
-
-        sample_logprobs = sample_logprobs.reshape(-1, sample_logprobs.shape[-1])
-        print(sample_logprobs.shape)
-        gtMask = torch.where(gt==-1,cond.type(torch.float32),cond2.type(torch.float32))
-        print('GTMASK',gtMask.shape)
-        gtMask = torch.reshape(gtMask,(640,1)).repeat(5,1)
-        
-        print('Computing loss')
-        #a = sample_logprobs*torch.reshape(reward,(3200,1))*gtMask
-        b = gt.flatten().repeat(5)
-        #print(a)
-        #print(b)
-
-        loss = nnf.cross_entropy(sample_logprobs*torch.reshape(reward,(3200,1))*gtMask, (gt.flatten().repeat(5)), ignore_index=-1)
-        loss_len = nnf.cross_entropy(len_out, (mask.sum(dim=-1).to(torch.long) -1).repeat(5) )
-        out['reward'] = reward[:,0].mean()
-        print('Mean reward:',out['reward'])
-        loss = loss + loss_len
-
-                
-        #coco = COCO(os.path.join(args.data_root, 'annotations/captions_val2014.json'))
-        #cocoRes = coco.loadRes(os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"))
-        #cocoEval = COCOEvalCap(coco, cocoRes, 'corpus', epoch, map_location)
-        #coco = coco.getAnns()
-        #print(cocoRes.dataset['annotations'])
-        #print('Divided')
-        #print(coco)
-        #loss_rl = loss(coco,coco,cocoRes.dataset['annotations'],sample_logprobs)
+        scores = np.stack([cider.score(sample_caps[j * n:(j + 1) * n] + [greedy_caps[j]], refs[j]) for j in range(b)])
+        sample_r, greedy_r = scores[:, :n], scores[:, n]
+        if args.scst_baseline == 'greedy':
+            baseline = np.repeat(greedy_r[:, None], n, 1)
+        else:  # mean reward of the other samples of the same image
+            baseline = (sample_r.sum(1, keepdims=True) - sample_r) / (n - 1)
+        advantage = torch.from_numpy((sample_r - baseline).reshape(-1)).float().cuda()
 
         optimizer.zero_grad()
-        scaler.scale(loss).backward()  # loss.backward()
-        scaler.step(optimizer)  # optimizer.step()
-        scaler.update()        
+        loss, logp_gap = scst.policy_gradient_backward(
+            model, core, feats, sample_len, steps, advantage, scaler,
+            guidance_scale=args.scst_guidance, sample_slot=args.scst_sample_slot,
+            sample_length=args.scst_sample_length, replay_steps=args.scst_replay_steps,
+            amp_enabled=args.enable_amp)
+        scaler.step(optimizer)
+        scaler.update()
         lr_scheduler.step_update(epoch * num_steps + idx)
-        torch.cuda.synchronize()
-        print('Loss:',loss.item())
 
+        global_step = num_steps * epoch + idx
+        writer.add_scalar('SCST/sample_cider', sample_r.mean(), global_step)
+        writer.add_scalar('SCST/greedy_cider', greedy_r.mean(), global_step)
+        writer.add_scalar('SCST/loss', loss, global_step)
+        writer.add_scalar('SCST/sample_len', sample_len.float().mean().item(), global_step)
+        writer.add_scalar('SCST/replay_logp_gap', logp_gap, global_step)
+        writer.add_scalar('Lr/Train', optimizer.param_groups[0]['lr'], global_step)
+        progress.set_postfix({'sample_cider': sample_r.mean(), 'greedy_cider': greedy_r.mean(), 'loss': loss,
+                              'lr': optimizer.param_groups[0]['lr']})
+        progress.update()
+    progress.close()
     return model
 
 
@@ -1231,8 +1121,9 @@ def main(args,rank):
     torch.cuda.set_device(local_rank)
     map_location = {'cuda:%d' % 0: 'cuda:%d' % local_rank}
 
-    ckpt = torch.load('results_diff/caption_diff_vitb16/caption_diff_vitb16-019.pt', map_location=map_location)
-    model.load_state_dict(ckpt["model"])
+    if args.init_checkpoint:
+        ckpt = torch.load(args.init_checkpoint, map_location=map_location)
+        model.load_state_dict(ckpt["model"])
 
     model = model.cuda()
 
@@ -1251,7 +1142,12 @@ def main(args,rank):
     #model.eval()
     #print(val(model=model, epoch=0, val_dataloader=val_dataloader, args=args, filename='CaneSuCose.jpg',instance=False,map_location=local_rank,writer=writer))
 
-    dataset = ClipCocoDataset(args.data_root, args.data, normalize_prefix=args.normalize_prefix)
+    if args.scst:
+        # self-critical runs on the training split, one item per image with all its references
+        dataset = ScstCocoDataset(args.data_root, args.data)
+        cider = scst.CiderD(dataset.refs)
+    else:
+        dataset = ClipCocoDataset(args.data_root, args.data, normalize_prefix=args.normalize_prefix)
     train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
     train_dataloader = DataLoader(dataset, batch_size=args.bs, sampler=train_sampler, num_workers=8, pin_memory=True, drop_last=True)
 
@@ -1259,9 +1155,10 @@ def main(args,rank):
 
 
 
-    lr_args = {"LR_SCHEDULER_NAME": "cosine", "EPOCHS": args.epochs, "WARMUP_EPOCHS": 5, "MIN_LR": 1e-6,
+    # self-critical fine-tunes a trained model for a few epochs, so it skips the warmup
+    lr_args = {"LR_SCHEDULER_NAME": "cosine", "EPOCHS": args.epochs, "WARMUP_EPOCHS": 0 if args.scst else 5, "MIN_LR": 1e-6,
                "WARMUP_LR": 1e-7}
-    lr_scheduler = build_scheduler(lr_args, optimizer, len(val_dataloader))
+    lr_scheduler = build_scheduler(lr_args, optimizer, len(train_dataloader))
 
     best_cider = 0
 
@@ -1269,8 +1166,10 @@ def main(args,rank):
 
 
     for epoch in range(args.epochs):
-        #_ = self_critical(val_dataloader,model,epoch,0,writerMetrics,optimizer,scaler,lr_scheduler)
-        _ = train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args, rank, writer, output_dir=args.out_dir, output_prefix=args.tag)
+        if args.scst:
+            _ = self_critical(model, epoch, train_dataloader, cider, optimizer, lr_scheduler, scaler, args, writer)
+        else:
+            _ = train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args, rank, writer, output_dir=args.out_dir, output_prefix=args.tag)
         result = val(model, epoch, val_dataloader, args, 'GirlOnAHorse.jpg', False, rank,writerMetrics)
         if epoch % args.save_every == 0 or epoch == args.epochs - 1:
             if dist.get_rank() == 0:
